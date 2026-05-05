@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CBAM YOLO dual-stream demo</title>
+  <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+    }
+    body { max-width: 1200px; margin: 0 auto; padding: 1rem; }
+    h1 { font-size: 1.25rem; font-weight: 600; }
+    .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; margin-top: 1rem; }
+    .panel { flex: 1 1 420px; min-width: 280px; }
+    video { width: 100%; background: #000; border-radius: 6px; }
+    label { display: block; margin-bottom: 0.35rem; font-size: 0.9rem; color: #bbb; }
+    button {
+      margin-top: 0.75rem;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      border: none;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-top: 0.75rem; font-size: 0.9rem; color: #9ca3af; min-height: 1.25rem; }
+    #error { color: #f87171; margin-top: 0.5rem; }
+    .legend { font-size: 0.85rem; color: #9ca3af; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>CBAM YOLO segmentation — dual stream comparison</h1>
+  <p class="legend">Upload a video. The server renders two MP4s: Model A overlay (magenta) vs Model B overlay (green).</p>
+
+  <div>
+    <label for="video">Video file</label>
+    <input id="video" type="file" accept="video/*" />
+  </div>
+  <button id="go" type="button">Render comparison</button>
+  <div id="status"></div>
+  <div id="error"></div>
+
+  <div class="row">
+    <div class="panel">
+      <label>YOLO26n Baseline</label>
+      <video id="va" controls playsinline></video>
+    </div>
+    <div class="panel">
+      <label>YOLO26n + CBAM</label>
+      <video id="vb" controls playsinline></video>
+    </div>
+  </div>
+
+  <script>
+    const $video = document.getElementById("video");
+    const $go = document.getElementById("go");
+    const $status = document.getElementById("status");
+    const $error = document.getElementById("error");
+    const $va = document.getElementById("va");
+    const $vb = document.getElementById("vb");
+
+    let pollTimer = null;
+
+    function clearPoll() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function bindSync() {
+      let syncing = false;
+      const syncPair = (leader, follower, action) => {
+        leader.addEventListener(action, () => {
+          if (syncing) return;
+          syncing = true;
+          try {
+            if (action === "play") {
+              if (Math.abs(follower.currentTime - leader.currentTime) > 0.15) {
+                follower.currentTime = leader.currentTime;
+              }
+              follower.play().catch(() => {});
+            } else {
+              follower.pause();
+            }
+          } finally {
+            syncing = false;
+          }
+        });
+      };
+      syncPair($va, $vb, "play");
+      syncPair($vb, $va, "play");
+      syncPair($va, $vb, "pause");
+      syncPair($vb, $va, "pause");
+    }
+    bindSync();
+
+    async function pollJob(jobId) {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || res.statusText);
+      }
+      return res.json();
+    }
+
+    $go.addEventListener("click", async () => {
+      clearPoll();
+      $error.textContent = "";
+      $va.removeAttribute("src");
+      $vb.removeAttribute("src");
+      $va.load();
+      $vb.load();
+
+      const file = $video.files && $video.files[0];
+      if (!file) {
+        $error.textContent = "Choose a video file first.";
+        return;
+      }
+
+      $go.disabled = true;
+      $status.textContent = "Uploading…";
+
+      const fd = new FormData();
+      fd.append("video", file);
+
+      try {
+        const r = await fetch("/api/render", { method: "POST", body: fd });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || r.statusText);
+        }
+        const { job_id: jobId } = await r.json();
+        $status.textContent = "Queued…";
+
+        pollTimer = setInterval(async () => {
+          try {
+            const j = await pollJob(jobId);
+            if (j.progress && typeof j.progress.current === "number") {
+              const t = j.progress.total != null ? ` / ${j.progress.total}` : "";
+              $status.textContent = `Rendering… frame ${j.progress.current}${t}`;
+            }
+            if (j.status === "done" && j.urls) {
+              clearPoll();
+              $va.src = j.urls.a;
+              $vb.src = j.urls.b;
+              $va.load();
+              $vb.load();
+              $status.textContent = "Done.";
+              $go.disabled = false;
+            }
+            if (j.status === "error") {
+              clearPoll();
+              $error.textContent = j.error || "Render failed.";
+              $status.textContent = "";
+              $go.disabled = false;
+            }
+          } catch (e) {
+            clearPoll();
+            $error.textContent = String(e.message || e);
+            $go.disabled = false;
+          }
+        }, 800);
+      } catch (e) {
+        $error.textContent = String(e.message || e);
+        $status.textContent = "";
+        $go.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
